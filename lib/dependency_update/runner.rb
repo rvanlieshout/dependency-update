@@ -10,7 +10,8 @@ module DependencyUpdate
     COOLDOWN_DAYS = Integer(ENV.fetch("DEPENDENCY_COOLDOWN_DAYS", "7"))
 
     def run
-      puts "Dependency update (#{COOLDOWN_DAYS}-day cooldown)"
+      puts "dependency-update (cooldown: #{COOLDOWN_DAYS} days)"
+      puts
       run_ruby_updates_with_cooldown
       run_yarn_updates_with_cooldown if yarn_present?
       run_importmap_updates_with_cooldown if importmap_present?
@@ -27,19 +28,21 @@ module DependencyUpdate
     end
 
     def run_ruby_updates_with_cooldown
-      puts "Running bundle update"
+      print "  bundle update... "
       before = gemfile_lock_versions
-      system("bundle update")
+      system("bundle update --quiet", out: File::NULL)
       after = gemfile_lock_versions
 
       updated = after.select { |name, ver| before[name] && before[name] != ver }
-      on_cooldown = updated.select { |name, ver| gem_in_cooldown?(name, ver) }
+      puts updated.any? ? "#{updated.size} updated" : "nothing to update"
+
+      on_cooldown = cooldown_ages(updated) { |name, ver| gem_age_days(name, ver) }
       return if on_cooldown.empty?
 
-      log_on_cooldown("gem", on_cooldown.to_a)
-      system("git checkout -- Gemfile.lock")
+      log_on_cooldown("gem", on_cooldown)
+      system("git checkout -- Gemfile.lock", out: File::NULL, err: File::NULL)
       to_update = updated.keys - on_cooldown.keys
-      system("bundle update #{to_update.join(' ')}") if to_update.any?
+      system("bundle update --quiet #{to_update.join(' ')}", out: File::NULL) if to_update.any?
     end
 
     def gemfile_lock_versions
@@ -51,29 +54,33 @@ module DependencyUpdate
       end
     end
 
-    def gem_in_cooldown?(name, version)
+    def gem_age_days(name, version)
       path = "/api/v2/rubygems/#{URI.encode_uri_component(name)}/versions/#{URI.encode_uri_component(version)}.json"
       response = https_get("rubygems.org", path)
-      return false unless response.code == "200"
+      return nil unless response.code == "200"
 
       published_at = Time.parse(JSON.parse(response.body)["created_at"])
-      within_cooldown?(published_at, "#{name} #{version}")
+      (Time.now - published_at) / 86400
     rescue => e
       warn "  Could not check gem cooldown for #{name} #{version}: #{e.message}"
-      false
+      nil
     end
 
     def run_yarn_updates_with_cooldown
-      puts "Running yarn upgrade"
+      print "  yarn upgrade...  "
       outdated_before = yarn_outdated_packages
-      system("yarn upgrade --latest")
+      system("yarn upgrade --latest --silent", err: File::NULL)
+
+      puts outdated_before.any? ? "#{outdated_before.size} updated" : "nothing to update"
       return if outdated_before.empty?
 
-      on_cooldown = outdated_before.select { |name, info| npm_in_cooldown?(name, info[:latest]) }
+      on_cooldown = cooldown_ages(outdated_before.transform_values { |i| i[:latest] }) { |name, ver| npm_age_days(name, ver) }
       return if on_cooldown.empty?
 
-      log_on_cooldown("yarn package", on_cooldown.map { |n, i| [ n, i[:latest] ] })
-      on_cooldown.each { |name, info| system("yarn upgrade #{name}@#{info[:current]}") }
+      log_on_cooldown("yarn package", on_cooldown)
+      on_cooldown.each do |name, info|
+        system("yarn upgrade #{name}@#{outdated_before[name][:current]} --silent", err: File::NULL)
+      end
     end
 
     def yarn_outdated_packages
@@ -90,19 +97,20 @@ module DependencyUpdate
     end
 
     def run_importmap_updates_with_cooldown
-      puts "Running importmap update"
+      print "  importmap update... "
       before = parse_importmap_versions
-      system("bin/importmap update")
+      system("bin/importmap update", out: File::NULL)
       after = parse_importmap_versions
 
       updated = after.select { |pkg, ver| before[pkg] && before[pkg] != ver }
+      puts updated.any? ? "#{updated.size} updated" : "nothing to update"
       return if updated.empty?
 
-      on_cooldown = updated.select { |pkg, ver| npm_in_cooldown?(pkg, ver) }
+      on_cooldown = cooldown_ages(updated) { |pkg, ver| npm_age_days(pkg, ver) }
       return if on_cooldown.empty?
 
-      log_on_cooldown("importmap pin", on_cooldown.to_a)
-      on_cooldown.each { |pkg, _| system("bin/importmap pin #{pkg}@#{before[pkg]}") }
+      log_on_cooldown("importmap pin", on_cooldown)
+      on_cooldown.each { |pkg, _| system("bin/importmap pin #{pkg}@#{before[pkg]}", out: File::NULL) }
     end
 
     def parse_importmap_versions
@@ -115,31 +123,32 @@ module DependencyUpdate
       end
     end
 
-    def npm_in_cooldown?(package, version)
+    def npm_age_days(package, version)
       encoded = package.gsub("/", "%2F")
       response = https_get("registry.npmjs.org", "/#{encoded}")
-      return false unless response.code == "200"
+      return nil unless response.code == "200"
 
       time_str = JSON.parse(response.body).dig("time", version)
-      return false unless time_str
+      return nil unless time_str
 
-      within_cooldown?(Time.parse(time_str), "#{package} #{version}")
+      (Time.now - Time.parse(time_str)) / 86400
     rescue => e
       warn "  Could not check npm cooldown for #{package} #{version}: #{e.message}"
-      false
+      nil
     end
 
-    def within_cooldown?(published_at, label)
-      age_days = (Time.now - published_at) / 86400
-      return false unless age_days < COOLDOWN_DAYS
-
-      puts "  COOLDOWN: #{label} (#{age_days.round(1)} days old, minimum #{COOLDOWN_DAYS})"
-      true
+    # Returns {name => {version:, age:}} for packages within the cooldown period.
+    # Yields name and version to get age_days (nil = unknown, skip cooldown check).
+    def cooldown_ages(updated, &age_fn)
+      updated.each_with_object({}) do |(name, version), result|
+        age = age_fn.call(name, version)
+        result[name] = { version: version, age: age.round(1) } if age && age < COOLDOWN_DAYS
+      end
     end
 
     def log_on_cooldown(kind, items)
-      puts "Holding back #{items.size} #{kind}(s) — released within the last #{COOLDOWN_DAYS} days:"
-      items.each { |name, version| puts "  #{name} #{version}" }
+      puts "  holding back #{items.size} #{kind}(s) — not yet #{COOLDOWN_DAYS} days old:"
+      items.each { |name, info| puts "    #{name} #{info[:version]} (#{info[:age]} days old)" }
     end
 
     def https_get(host, path)
