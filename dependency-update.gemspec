@@ -13,6 +13,7 @@ Gem::Specification.new do |spec|
   spec.required_ruby_version = ">= 3.0.0"
 
   spec.files = Dir["lib/**/*.rb", "exe/*"]
+  spec.bindir = "exe"
   spec.executables = ["dependency_update"]
   spec.require_paths = ["lib"]
 end
