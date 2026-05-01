@@ -10,11 +10,18 @@ module DependencyUpdate
     COOLDOWN_DAYS = Integer(ENV.fetch("DEPENDENCY_COOLDOWN_DAYS", "7"))
 
     def run
-      puts "dependency-update (cooldown: #{COOLDOWN_DAYS} days)"
+      $stdout.sync = true
+      puts bold("dependency-update") + " (cooldown: #{COOLDOWN_DAYS} days)"
       puts
+
+      @summary = []
+      @held_back = []
+
       run_ruby_updates_with_cooldown
       run_yarn_updates_with_cooldown if yarn_present?
       run_importmap_updates_with_cooldown if importmap_present?
+
+      print_summary
     end
 
     private
@@ -28,21 +35,20 @@ module DependencyUpdate
     end
 
     def run_ruby_updates_with_cooldown
-      print "  bundle update... "
+      section("bundle update")
       before = gemfile_lock_versions
-      system("bundle update --quiet", out: File::NULL)
+      system("bundle update")
       after = gemfile_lock_versions
 
       updated = after.select { |name, ver| before[name] && before[name] != ver }
-      puts updated.any? ? "#{updated.size} updated" : "nothing to update"
-
       on_cooldown = cooldown_ages(updated) { |name, ver| gem_age_days(name, ver) }
+      record_summary("gems", updated.size, on_cooldown)
+
       return if on_cooldown.empty?
 
-      log_on_cooldown("gem", on_cooldown)
       system("git checkout -- Gemfile.lock", out: File::NULL, err: File::NULL)
       to_update = updated.keys - on_cooldown.keys
-      system("bundle update --quiet #{to_update.join(' ')}", out: File::NULL) if to_update.any?
+      system("bundle update #{to_update.join(' ')}") if to_update.any?
     end
 
     def gemfile_lock_versions
@@ -67,18 +73,16 @@ module DependencyUpdate
     end
 
     def run_yarn_updates_with_cooldown
-      print "  yarn upgrade...  "
+      section("yarn upgrade")
       outdated_before = yarn_outdated_packages
       system("yarn upgrade --latest --silent", err: File::NULL)
 
-      puts outdated_before.any? ? "#{outdated_before.size} updated" : "nothing to update"
-      return if outdated_before.empty?
-
       on_cooldown = cooldown_ages(outdated_before.transform_values { |i| i[:latest] }) { |name, ver| npm_age_days(name, ver) }
+      record_summary("yarn", outdated_before.size, on_cooldown)
+
       return if on_cooldown.empty?
 
-      log_on_cooldown("yarn package", on_cooldown)
-      on_cooldown.each do |name, info|
+      on_cooldown.each do |name, _|
         system("yarn upgrade #{name}@#{outdated_before[name][:current]} --silent", err: File::NULL)
       end
     end
@@ -97,19 +101,17 @@ module DependencyUpdate
     end
 
     def run_importmap_updates_with_cooldown
-      print "  importmap update... "
+      section("importmap update")
       before = parse_importmap_versions
-      system("bin/importmap update", out: File::NULL)
+      system("bin/importmap update")
       after = parse_importmap_versions
 
       updated = after.select { |pkg, ver| before[pkg] && before[pkg] != ver }
-      puts updated.any? ? "#{updated.size} updated" : "nothing to update"
-      return if updated.empty?
-
       on_cooldown = cooldown_ages(updated) { |pkg, ver| npm_age_days(pkg, ver) }
+      record_summary("importmap", updated.size, on_cooldown)
+
       return if on_cooldown.empty?
 
-      log_on_cooldown("importmap pin", on_cooldown)
       on_cooldown.each { |pkg, _| system("bin/importmap pin #{pkg}@#{before[pkg]}", out: File::NULL) }
     end
 
@@ -137,8 +139,6 @@ module DependencyUpdate
       nil
     end
 
-    # Returns {name => {version:, age:}} for packages within the cooldown period.
-    # Yields name and version to get age_days (nil = unknown, skip cooldown check).
     def cooldown_ages(updated, &age_fn)
       updated.each_with_object({}) do |(name, version), result|
         age = age_fn.call(name, version)
@@ -146,10 +146,46 @@ module DependencyUpdate
       end
     end
 
-    def log_on_cooldown(kind, items)
-      puts "  holding back #{items.size} #{kind}(s) — not yet #{COOLDOWN_DAYS} days old:"
-      items.each { |name, info| puts "    #{name} #{info[:version]} (#{info[:age]} days old)" }
+    def record_summary(kind, updated_count, on_cooldown)
+      @held_back.concat(on_cooldown.to_a)
+      line = if updated_count.zero?
+               "#{kind}: nothing to update"
+             elsif on_cooldown.any?
+               "#{kind}: #{updated_count} updated, #{yellow("#{on_cooldown.size} held back")}"
+             else
+               "#{kind}: #{green("#{updated_count} updated")}"
+             end
+      @summary << line
     end
+
+    def print_summary
+      puts
+      puts dim("─" * 42)
+      puts bold("Summary")
+      @summary.each { |line| puts "  #{line}" }
+
+      if @held_back.any?
+        puts
+        puts "  #{yellow("held back")} — not yet #{COOLDOWN_DAYS} days old:"
+        @held_back.each do |name, info|
+          puts "    #{name} #{info[:version]} #{dim("(#{info[:age]} days old)")}"
+        end
+      end
+      puts dim("─" * 42)
+    end
+
+    def section(title)
+      puts cyan(bold(title))
+      puts dim("─" * title.length)
+    end
+
+    def tty? = $stdout.isatty
+
+    def bold(text)  = tty? ? "\e[1m#{text}\e[0m"  : text
+    def dim(text)   = tty? ? "\e[2m#{text}\e[0m"  : text
+    def cyan(text)  = tty? ? "\e[36m#{text}\e[0m" : text
+    def green(text) = tty? ? "\e[32m#{text}\e[0m" : text
+    def yellow(text)= tty? ? "\e[33m#{text}\e[0m" : text
 
     def https_get(host, path)
       Net::HTTP.start(host, 443, use_ssl: true, open_timeout: 10, read_timeout: 30) do |http|
