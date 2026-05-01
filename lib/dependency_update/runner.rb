@@ -75,15 +75,16 @@ module DependencyUpdate
     def run_yarn_updates_with_cooldown
       section("yarn upgrade")
       outdated_before = yarn_outdated_packages
-      system("yarn upgrade --latest --silent", err: File::NULL)
+      system("yarn upgrade --latest --silent", out: File::NULL, err: File::NULL)
+      updated_count = `git diff --unified=0 yarn.lock 2>/dev/null | grep -c '^+  version'`.strip.to_i
 
       on_cooldown = cooldown_ages(outdated_before.transform_values { |i| i[:latest] }) { |name, ver| npm_age_days(name, ver) }
-      record_summary("yarn", outdated_before.size, on_cooldown)
+      record_summary("yarn", updated_count, on_cooldown)
 
       return if on_cooldown.empty?
 
       on_cooldown.each do |name, _|
-        system("yarn upgrade #{name}@#{outdated_before[name][:current]} --silent", err: File::NULL)
+        system("yarn upgrade #{name}@#{outdated_before[name][:current]} --silent", out: File::NULL, err: File::NULL)
       end
     end
 
