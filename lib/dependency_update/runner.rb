@@ -131,12 +131,12 @@ module DependencyUpdate
       return if on_cooldown.empty?
 
       on_cooldown.each do |name, info|
-        best   = npm_best_allowed_version(name)
-        prev   = outdated_before[name][:current]
+        best     = npm_best_allowed_version(name)
+        prev     = outdated_before[name][:current]
         use_best = best && Gem::Version.new(best) > Gem::Version.new(prev)
-        target = use_best ? best : prev
+        target   = use_best ? best : prev
         info[:best] = best if use_best
-        system("yarn upgrade #{name}@#{target} --silent", out: File::NULL, err: File::NULL)
+        set_package_json_version(name, target)
       end
       system("yarn install --silent", out: File::NULL, err: File::NULL)
     end
@@ -222,6 +222,16 @@ module DependencyUpdate
         ver_match = line.match(/#\s*@(\d[\d.]*)/)
         pins[pkg_match[1]] = ver_match[1] if pkg_match && ver_match
       end
+    end
+
+    def set_package_json_version(name, version)
+      return unless File.exist?("package.json")
+
+      content = File.read("package.json")
+      updated = content.gsub(/"#{Regexp.escape(name)}"\s*:\s*"[^"]*"/, "\"#{name}\": \"#{version}\"")
+      File.write("package.json", updated)
+    rescue => e
+      warn "  Could not update package.json for #{name}: #{e.message}"
     end
 
     # ── Shared helpers ────────────────────────────────────────────────────────
