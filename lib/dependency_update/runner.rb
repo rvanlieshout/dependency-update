@@ -14,8 +14,10 @@ module DependencyUpdate
       puts bold("dependency-update") + " (cooldown: #{COOLDOWN_DAYS} days)"
       puts
 
-      @summary = []
-      @held_back = []
+      @summary    = []
+      @held_back  = []
+      @npm_cache  = {}
+      @gem_cache  = {}
 
       run_ruby_updates_with_cooldown
       run_yarn_updates_with_cooldown if yarn_present?
@@ -34,21 +36,34 @@ module DependencyUpdate
       File.exist?("config/importmap.rb") && File.exist?("bin/importmap")
     end
 
+    # ── Gems ─────────────────────────────────────────────────────────────────
+
     def run_ruby_updates_with_cooldown
       section("bundle update")
       before = gemfile_lock_versions
       system("bundle update")
       after = gemfile_lock_versions
 
-      updated = after.select { |name, ver| before[name] && before[name] != ver }
+      updated    = after.select { |name, ver| before[name] && before[name] != ver }
       on_cooldown = cooldown_ages(updated) { |name, ver| gem_age_days(name, ver) }
       record_summary("gems", updated.size, on_cooldown)
 
       return if on_cooldown.empty?
 
       system("git checkout -- Gemfile.lock", out: File::NULL, err: File::NULL)
+
+      # Update non-cooldown gems normally
       to_update = updated.keys - on_cooldown.keys
       system("bundle update #{to_update.join(' ')}") if to_update.any?
+
+      # For each cooldown gem, try to install the best allowed version
+      on_cooldown.each do |name, info|
+        best = gem_best_allowed_version(name)
+        next unless best && Gem::Version.new(best) > Gem::Version.new(before[name])
+
+        info[:best] = best
+        apply_gem_version(name, best)
+      end
     end
 
     def gemfile_lock_versions
@@ -65,12 +80,44 @@ module DependencyUpdate
       response = https_get("rubygems.org", path)
       return nil unless response.code == "200"
 
-      published_at = Time.parse(JSON.parse(response.body)["created_at"])
-      (Time.now - published_at) / 86400
+      (Time.now - Time.parse(JSON.parse(response.body)["created_at"])) / 86400
     rescue => e
       warn "  Could not check gem cooldown for #{name} #{version}: #{e.message}"
       nil
     end
+
+    def gem_best_allowed_version(name)
+      @gem_cache[name] ||= begin
+        response = https_get("rubygems.org", "/api/v1/versions/#{URI.encode_uri_component(name)}.json")
+        response.code == "200" ? JSON.parse(response.body) : nil
+      end
+
+      versions = @gem_cache[name]
+      return nil unless versions
+
+      cutoff = Time.now - (COOLDOWN_DAYS * 86400)
+      versions
+        .reject { |v| v["prerelease"] }
+        .select { |v| Time.parse(v["created_at"]) <= cutoff rescue false }
+        .max_by { |v| Gem::Version.new(v["number"]) rescue Gem::Version.new("0") }
+        &.fetch("number")
+    rescue => e
+      warn "  Could not fetch gem versions for #{name}: #{e.message}"
+      nil
+    end
+
+    def apply_gem_version(name, version)
+      # Temporarily pin the gem in Gemfile, bundle install, then remove the pin
+      marker = "# __dep_update_pin__"
+      pin_line = "gem \"#{name}\", \"= #{version}\" #{marker}\n"
+      File.open("Gemfile", "a") { |f| f.write(pin_line) }
+      system("bundle install --quiet", out: File::NULL)
+    ensure
+      gemfile = File.read("Gemfile")
+      File.write("Gemfile", gemfile.gsub(/^.*#{Regexp.escape(marker)}.*\n/, ""))
+    end
+
+    # ── Yarn ─────────────────────────────────────────────────────────────────
 
     def run_yarn_updates_with_cooldown
       section("yarn upgrade")
@@ -83,8 +130,12 @@ module DependencyUpdate
 
       return if on_cooldown.empty?
 
-      on_cooldown.each do |name, _|
-        system("yarn upgrade #{name}@#{outdated_before[name][:current]} --silent", out: File::NULL, err: File::NULL)
+      on_cooldown.each do |name, info|
+        best = npm_best_allowed_version(name)
+        prev = outdated_before[name][:current]
+        target = (best && Gem::Version.new(best) > Gem::Version.new(prev)) ? best : prev
+        info[:best] = best if best != prev
+        system("yarn upgrade #{name}@#{target} --silent", out: File::NULL, err: File::NULL)
       end
     end
 
@@ -101,19 +152,63 @@ module DependencyUpdate
       end.flatten(1).to_h
     end
 
+    def npm_package_data(package)
+      @npm_cache[package] ||= begin
+        encoded  = package.gsub("/", "%2F")
+        response = https_get("registry.npmjs.org", "/#{encoded}")
+        response.code == "200" ? JSON.parse(response.body) : nil
+      end
+    rescue => e
+      warn "  Could not fetch npm data for #{package}: #{e.message}"
+      nil
+    end
+
+    def npm_age_days(package, version)
+      data     = npm_package_data(package)
+      time_str = data&.dig("time", version)
+      return nil unless time_str
+
+      (Time.now - Time.parse(time_str)) / 86400
+    rescue => e
+      warn "  Could not check npm cooldown for #{package} #{version}: #{e.message}"
+      nil
+    end
+
+    def npm_best_allowed_version(package)
+      data = npm_package_data(package)
+      return nil unless data
+
+      cutoff = Time.now - (COOLDOWN_DAYS * 86400)
+      data["time"]
+        .reject { |k, _| %w[created modified].include?(k) }
+        .select { |_, t| Time.parse(t) <= cutoff rescue false }
+        .max_by { |ver, _| Gem::Version.new(ver) rescue Gem::Version.new("0") }
+        &.first
+    rescue
+      nil
+    end
+
+    # ── Importmap ─────────────────────────────────────────────────────────────
+
     def run_importmap_updates_with_cooldown
       section("importmap update")
       before = parse_importmap_versions
       system("bin/importmap update")
       after = parse_importmap_versions
 
-      updated = after.select { |pkg, ver| before[pkg] && before[pkg] != ver }
+      updated    = after.select { |pkg, ver| before[pkg] && before[pkg] != ver }
       on_cooldown = cooldown_ages(updated) { |pkg, ver| npm_age_days(pkg, ver) }
       record_summary("importmap", updated.size, on_cooldown)
 
       return if on_cooldown.empty?
 
-      on_cooldown.each { |pkg, _| system("bin/importmap pin #{pkg}@#{before[pkg]}", out: File::NULL) }
+      on_cooldown.each do |pkg, info|
+        best = npm_best_allowed_version(pkg)
+        prev = before[pkg]
+        target = (best && Gem::Version.new(best) > Gem::Version.new(prev)) ? best : prev
+        info[:best] = best if best && best != prev
+        system("bin/importmap pin #{pkg}@#{target}", out: File::NULL)
+      end
     end
 
     def parse_importmap_versions
@@ -126,19 +221,7 @@ module DependencyUpdate
       end
     end
 
-    def npm_age_days(package, version)
-      encoded = package.gsub("/", "%2F")
-      response = https_get("registry.npmjs.org", "/#{encoded}")
-      return nil unless response.code == "200"
-
-      time_str = JSON.parse(response.body).dig("time", version)
-      return nil unless time_str
-
-      (Time.now - Time.parse(time_str)) / 86400
-    rescue => e
-      warn "  Could not check npm cooldown for #{package} #{version}: #{e.message}"
-      nil
-    end
+    # ── Shared helpers ────────────────────────────────────────────────────────
 
     def cooldown_ages(updated, &age_fn)
       updated.each_with_object({}) do |(name, version), result|
@@ -169,7 +252,11 @@ module DependencyUpdate
         puts
         puts "  #{yellow("held back")} — not yet #{COOLDOWN_DAYS} days old:"
         @held_back.each do |name, info|
-          puts "    #{name} #{info[:version]} #{dim("(#{info[:age]} days old)")}"
+          latest  = info[:version]
+          age     = info[:age]
+          best    = info[:best]
+          note    = best ? " → installed #{green(best)}" : ""
+          puts "    #{name} #{latest} #{dim("(#{age} days old)")}#{note}"
         end
       end
       puts dim("─" * 42)
@@ -180,13 +267,12 @@ module DependencyUpdate
       puts dim("─" * title.length)
     end
 
-    def tty? = $stdout.isatty
-
-    def bold(text)  = tty? ? "\e[1m#{text}\e[0m"  : text
-    def dim(text)   = tty? ? "\e[2m#{text}\e[0m"  : text
-    def cyan(text)  = tty? ? "\e[36m#{text}\e[0m" : text
-    def green(text) = tty? ? "\e[32m#{text}\e[0m" : text
-    def yellow(text)= tty? ? "\e[33m#{text}\e[0m" : text
+    def tty?          = $stdout.isatty
+    def bold(text)    = tty? ? "\e[1m#{text}\e[0m"  : text
+    def dim(text)     = tty? ? "\e[2m#{text}\e[0m"  : text
+    def cyan(text)    = tty? ? "\e[36m#{text}\e[0m" : text
+    def green(text)   = tty? ? "\e[32m#{text}\e[0m" : text
+    def yellow(text)  = tty? ? "\e[33m#{text}\e[0m" : text
 
     def https_get(host, path)
       Net::HTTP.start(host, 443, use_ssl: true, open_timeout: 10, read_timeout: 30) do |http|
