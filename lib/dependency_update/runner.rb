@@ -131,12 +131,14 @@ module DependencyUpdate
       return if on_cooldown.empty?
 
       on_cooldown.each do |name, info|
-        best = npm_best_allowed_version(name)
-        prev = outdated_before[name][:current]
-        target = (best && Gem::Version.new(best) > Gem::Version.new(prev)) ? best : prev
-        info[:best] = best if best != prev
+        best   = npm_best_allowed_version(name)
+        prev   = outdated_before[name][:current]
+        use_best = best && Gem::Version.new(best) > Gem::Version.new(prev)
+        target = use_best ? best : prev
+        info[:best] = best if use_best
         system("yarn upgrade #{name}@#{target} --silent", out: File::NULL, err: File::NULL)
       end
+      system("yarn install --silent", out: File::NULL, err: File::NULL)
     end
 
     def yarn_outdated_packages
@@ -203,10 +205,11 @@ module DependencyUpdate
       return if on_cooldown.empty?
 
       on_cooldown.each do |pkg, info|
-        best = npm_best_allowed_version(pkg)
-        prev = before[pkg]
-        target = (best && Gem::Version.new(best) > Gem::Version.new(prev)) ? best : prev
-        info[:best] = best if best && best != prev
+        best     = npm_best_allowed_version(pkg)
+        prev     = before[pkg]
+        use_best = best && Gem::Version.new(best) > Gem::Version.new(prev)
+        target   = use_best ? best : prev
+        info[:best] = best if use_best
         system("bin/importmap pin #{pkg}@#{target}", out: File::NULL)
       end
     end
