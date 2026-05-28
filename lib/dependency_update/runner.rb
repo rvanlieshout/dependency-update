@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "bundler"
 require "json"
 require "net/http"
 require "time"
@@ -41,7 +42,7 @@ module DependencyUpdate
     def run_ruby_updates_with_cooldown
       section("bundle update")
       before = gemfile_lock_versions
-      system("bundle update")
+      bundle("update")
       after = gemfile_lock_versions
 
       updated    = after.select { |name, ver| before[name] && before[name] != ver }
@@ -54,7 +55,7 @@ module DependencyUpdate
 
       # Update non-cooldown gems normally
       to_update = updated.keys - on_cooldown.keys
-      system("bundle update #{to_update.join(' ')}") if to_update.any?
+      bundle("update #{to_update.join(' ')}") if to_update.any?
 
       # For each cooldown gem, try to install the best allowed version
       on_cooldown.each do |name, info|
@@ -128,9 +129,18 @@ module DependencyUpdate
       end
 
       File.write("Gemfile", pinned)
-      system("bundle install --quiet", out: File::NULL)
+      bundle("install --quiet", out: File::NULL)
     ensure
       File.write("Gemfile", original) if original
+    end
+
+    # Run a bundler subprocess in a clean environment. dependency_update itself
+    # runs under `bundle exec`, so child processes inherit RUBYOPT=-rbundler/setup
+    # and BUNDLE_GEMFILE. With a temporarily pinned Gemfile that would make the
+    # child abort in `require "bundler/setup"` (Gemfile/lock mismatch) before the
+    # bundle command can resolve. with_unbundled_env strips that inherited state.
+    def bundle(args, **opts)
+      Bundler.with_unbundled_env { system("bundle #{args}", **opts) }
     end
 
     # ── Yarn ─────────────────────────────────────────────────────────────────
