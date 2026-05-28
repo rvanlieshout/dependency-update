@@ -107,14 +107,30 @@ module DependencyUpdate
     end
 
     def apply_gem_version(name, version)
-      # Temporarily pin the gem in Gemfile, bundle install, then remove the pin
-      marker = "# __dep_update_pin__"
-      pin_line = "gem \"#{name}\", \"= #{version}\" #{marker}\n"
-      File.open("Gemfile", "a") { |f| f.write(pin_line) }
+      # Temporarily pin the gem in Gemfile, bundle install, then restore the Gemfile.
+      marker   = "# __dep_update_pin__"
+      original = File.read("Gemfile")
+
+      # Match an existing declaration: gem "name" or gem 'name', <options>
+      pattern = /^([ \t]*)gem\s+(['"])#{Regexp.escape(name)}\2(.*)$/
+
+      pinned = original.sub(pattern) do
+        indent, quote, rest = $1, $2, $3
+        # Drop an existing version requirement (leading quoted string), keep options.
+        options = rest.sub(/\A\s*,\s*(['"])[^'"]*\1/, "")
+        "#{indent}gem #{quote}#{name}#{quote}, #{quote}= #{version}#{quote}#{options} #{marker}"
+      end
+
+      # Not already declared (transitive dependency): append a pin line.
+      if pinned == original
+        pinned += "\n" unless pinned.end_with?("\n")
+        pinned += "gem \"#{name}\", \"= #{version}\" #{marker}\n"
+      end
+
+      File.write("Gemfile", pinned)
       system("bundle install --quiet", out: File::NULL)
     ensure
-      gemfile = File.read("Gemfile")
-      File.write("Gemfile", gemfile.gsub(/^.*#{Regexp.escape(marker)}.*\n/, ""))
+      File.write("Gemfile", original) if original
     end
 
     # ── Yarn ─────────────────────────────────────────────────────────────────
