@@ -131,7 +131,12 @@ module DependencyUpdate
       File.write("Gemfile", pinned)
       bundle("install --quiet", out: File::NULL)
     ensure
-      File.write("Gemfile", original) if original
+      if original
+        File.write("Gemfile", original)
+        # Re-resolve so the "= version" pin is dropped from Gemfile.lock's
+        # DEPENDENCIES section; the locked version stays the same.
+        bundle("install --quiet", out: File::NULL)
+      end
     end
 
     # Run a bundler subprocess in a clean environment. dependency_update itself
