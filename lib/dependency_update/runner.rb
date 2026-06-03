@@ -18,6 +18,7 @@ module DependencyUpdate
     def run
       $stdout.sync = true
       puts bold("dependency-update") + " (cooldown: #{COOLDOWN_DAYS} days)"
+      upgrade_bundler_for_cooldown
       print_bundler_cooldown_notice
       puts
 
@@ -48,7 +49,7 @@ module DependencyUpdate
     def run_ruby_updates_with_cooldown
       section("bundle update")
       before = gemfile_lock_versions
-      bundle("update#{bundler_cooldown_flag}")
+      bundle("update --all#{bundler_cooldown_flag}")
       after = gemfile_lock_versions
 
       updated    = after.select { |name, ver| before[name] && before[name] != ver }
@@ -170,6 +171,34 @@ module DependencyUpdate
     def bundler_supports_cooldown?
       version = bundler_version
       !version.nil? && version >= BUNDLER_COOLDOWN_VERSION
+    end
+
+    # The project's Gemfile.lock pins a bundler via "BUNDLED WITH"; bundler
+    # auto-switches to it for normal commands. When that pin predates native
+    # cooldown but a capable bundler is installed, bump the pin so the rest of
+    # the run resolves under native cooldown. No-op once already on 4.0.13+.
+    def upgrade_bundler_for_cooldown
+      current = bundler_version
+      return if current && current >= BUNDLER_COOLDOWN_VERSION
+
+      newest = newest_installed_bundler
+      return unless newest && newest >= BUNDLER_COOLDOWN_VERSION
+
+      puts dim("bumping bundler #{current || '?'} → #{newest} (BUNDLED WITH) for native cooldown")
+      # Force the capable bundler (`_VERSION_`) so the bump target is
+      # deterministic regardless of the pinned version's auto-switch.
+      bundle("_#{newest}_ update --bundler=#{newest}", out: File::NULL, err: File::NULL)
+      @bundler_version = newest
+    end
+
+    # Newest bundler installed on the system, regardless of the lockfile pin.
+    def newest_installed_bundler
+      output   = Bundler.with_unbundled_env { `gem list -e bundler 2>/dev/null` }
+      versions = output.scan(/\d+\.\d+\.\d+/).map { |v| Gem::Version.new(v) }
+      versions.max
+    rescue => e
+      warn "  Could not list installed bundler versions: #{e.message}"
+      nil
     end
 
     def bundler_cooldown_flag
