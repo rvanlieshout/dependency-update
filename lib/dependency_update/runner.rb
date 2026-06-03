@@ -10,9 +10,15 @@ module DependencyUpdate
   class Runner
     COOLDOWN_DAYS = Integer(ENV.fetch("DEPENDENCY_COOLDOWN_DAYS", "7"))
 
+    # Bundler 4.0.13+ ships a native, time-based cooldown filter. When the
+    # active bundler supports it we let bundler enforce the cooldown directly
+    # (via --cooldown); otherwise we fall back to the API-based logic below.
+    BUNDLER_COOLDOWN_VERSION = Gem::Version.new("4.0.13")
+
     def run
       $stdout.sync = true
       puts bold("dependency-update") + " (cooldown: #{COOLDOWN_DAYS} days)"
+      print_bundler_cooldown_notice
       puts
 
       @summary    = []
@@ -42,7 +48,7 @@ module DependencyUpdate
     def run_ruby_updates_with_cooldown
       section("bundle update")
       before = gemfile_lock_versions
-      bundle("update")
+      bundle("update#{bundler_cooldown_flag}")
       after = gemfile_lock_versions
 
       updated    = after.select { |name, ver| before[name] && before[name] != ver }
@@ -55,7 +61,7 @@ module DependencyUpdate
 
       # Update non-cooldown gems normally
       to_update = updated.keys - on_cooldown.keys
-      bundle("update #{to_update.join(' ')}") if to_update.any?
+      bundle("update #{to_update.join(' ')}#{bundler_cooldown_flag}") if to_update.any?
 
       # For each cooldown gem, try to install the best allowed version
       on_cooldown.each do |name, info|
@@ -146,6 +152,37 @@ module DependencyUpdate
     # bundle command can resolve. with_unbundled_env strips that inherited state.
     def bundle(args, **opts)
       Bundler.with_unbundled_env { system("bundle #{args}", **opts) }
+    end
+
+    # Version of the `bundle` executable we actually shell out to (not
+    # necessarily Bundler::VERSION loaded in this process).
+    def bundler_version
+      return @bundler_version if defined?(@bundler_version)
+
+      output = Bundler.with_unbundled_env { `bundle --version 2>/dev/null` }
+      match  = output[/\d+\.\d+\.\d+/]
+      @bundler_version = match && Gem::Version.new(match)
+    rescue => e
+      warn "  Could not determine bundler version: #{e.message}"
+      @bundler_version = nil
+    end
+
+    def bundler_supports_cooldown?
+      version = bundler_version
+      !version.nil? && version >= BUNDLER_COOLDOWN_VERSION
+    end
+
+    def bundler_cooldown_flag
+      bundler_supports_cooldown? ? " --cooldown #{COOLDOWN_DAYS}" : ""
+    end
+
+    def print_bundler_cooldown_notice
+      if bundler_supports_cooldown?
+        puts dim("bundler #{bundler_version}: native cooldown active (--cooldown #{COOLDOWN_DAYS})")
+      else
+        current = bundler_version || "unknown"
+        puts yellow("⚠ bundler #{current} has no native cooldown — upgrade to >= #{BUNDLER_COOLDOWN_VERSION} for built-in supply-chain protection (`gem update bundler`). Using API-based fallback for now.")
+      end
     end
 
     # ── Yarn ─────────────────────────────────────────────────────────────────
