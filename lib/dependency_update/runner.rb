@@ -246,7 +246,7 @@ module DependencyUpdate
         data = JSON.parse(line)
         next unless data["type"] == "table"
         data["data"]["body"].map { |row| [ row[0], { current: row[1], latest: row[3] } ] }
-      rescue JSON::ParseError
+      rescue JSON::ParserError
         nil
       end.flatten(1).to_h
     end
