@@ -8,7 +8,7 @@ Gem::Specification.new do |spec|
   spec.authors = ["Rene van Lieshout"]
   spec.email = ["rene@lico.nl"]
   spec.summary = "Update Ruby, Yarn, and Importmap dependencies with a cooldown period"
-  spec.homepage = "https://forgejo.lico.nl/rvanlieshout/dependency-update"
+  spec.homepage = "https://github.com/rvanlieshout/dependency-update"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.0.0"
 
