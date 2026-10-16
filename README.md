@@ -16,25 +16,56 @@ present:
 | Ecosystem | Trigger | Command used |
 | --------- | ------- | ------------ |
 | Ruby gems | always | `bundle update --all` |
-| Yarn | `yarn.lock` exists | `yarn upgrade --latest` |
+| Yarn (berry) | `yarn.lock` exists, yarn 4.10+ | `yarn up '*'` |
+| Yarn (classic) | `yarn.lock` exists, yarn 1.x | `yarn upgrade --latest` |
 | Importmap | `config/importmap.rb` and `bin/importmap` exist | `bin/importmap update` |
 
-For each ecosystem it resolves the latest versions, then checks the publication
-date of every bump. Anything released within the cooldown window is rolled back
-and replaced with the newest version that is already older than the cooldown. If
-none qualifies, it keeps the currently locked version. At the end it prints a
-summary of what was updated and what was held back, with ages.
+Where the package manager enforces the cooldown itself, `dependency-update` just
+hands it the window and lets it resolve. Where it does not, the tool resolves the
+latest versions, then checks the publication date of every bump. Anything
+released within the cooldown window is rolled back and replaced with the newest
+version that is already older than the cooldown. If none qualifies, it keeps the
+currently locked version. At the end it prints a summary of what was updated and
+what was held back, with ages.
 
-Release dates come from the public registries: rubygems.org for gems, and
-registry.npmjs.org for Yarn and Importmap packages.
+Release dates for the fallback path come from the public registries:
+rubygems.org for gems, and registry.npmjs.org for Yarn and Importmap packages.
 
-## Bundler native cooldown
+## Native cooldown support
 
-Bundler 4.0.13 and newer ship a built in `--cooldown` filter. When a capable
-bundler is available, `dependency-update` uses it directly, and will bump the
-`BUNDLED WITH` pin in `Gemfile.lock` so the run resolves under native cooldown.
-On older bundlers it falls back to the rubygems.org API based logic above, and
-prints a notice recommending an upgrade.
+| Ecosystem | Native filter | Available since | Used when |
+| --------- | ------------- | --------------- | --------- |
+| Bundler | `--cooldown <days>` | 4.0.13 | bundler 4.0.13+ is installed |
+| Yarn | `npmMinimalAgeGate` | 4.10.0 | the project's yarn is 4.10+ |
+| Importmap | none | — | never; always the API fallback |
+
+See [cooldowns.dev](https://cooldowns.dev) for the state of native cooldown
+support across package managers.
+
+**Bundler.** A project's `Gemfile.lock` pins a bundler via `BUNDLED WITH`, and
+bundler auto switches to it. When that pin predates native cooldown but a capable
+bundler is installed, `dependency-update` bumps the pin so the run resolves under
+native cooldown. On older bundlers it falls back to the rubygems.org API based
+logic and prints a notice recommending an upgrade.
+
+**Yarn.** Yarn 4.10 and newer gate resolution on publication age. The gate is set
+per run via `YARN_NPM_MINIMAL_AGE_GATE`, so no `.yarnrc.yml` changes are needed.
+The value is always passed **in minutes**: yarn 4.15+ also accepts duration
+strings like `7d`, but 4.10–4.14 parse those numerically, turning `7d` into a
+seven *minute* gate that silently lets everything through. Yarn 1 (classic) has
+no equivalent and keeps the registry API fallback, with a notice recommending
+`yarn set version stable`.
+
+The yarn classic fallback covers transitive dependencies too. After the upgrade
+every version in `yarn.lock` that was not locked before is checked against
+registry.npmjs.org. A version inside the cooldown window is replaced, in place in
+`yarn.lock`, by the newest version that is older than the cooldown and still
+satisfies every range of that lockfile entry, followed by `yarn install`. This
+repeats for dependencies the replacement pulls in. When no older version fits
+the ranges, the young version stays and the summary says so.
+
+Note that yarn 4.15+ applies a one day gate by default, so a yarn project has
+some protection even without this tool.
 
 ## Installation
 

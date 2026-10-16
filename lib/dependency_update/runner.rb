@@ -15,6 +15,13 @@ module DependencyUpdate
     # (via --cooldown); otherwise we fall back to the API-based logic below.
     BUNDLER_COOLDOWN_VERSION = Gem::Version.new("4.0.13")
 
+    # Yarn 4.10+ (berry) ships a native age gate: npmMinimalAgeGate excludes
+    # versions published more recently than the configured number of minutes.
+    # Yarn 1 (classic) has nothing comparable, so it keeps the API-based fallback.
+    YARN_COOLDOWN_VERSION = Gem::Version.new("4.10.0")
+
+    YARN_LOCKFILE_PASSES = 5
+
     def run
       $stdout.sync = true
       puts bold("dependency-update") + " (cooldown: #{COOLDOWN_DAYS} days)"
@@ -218,24 +225,129 @@ module DependencyUpdate
 
     def run_yarn_updates_with_cooldown
       section("yarn upgrade")
+      print_yarn_cooldown_notice
+
+      if yarn_supports_cooldown?
+        run_yarn_native_cooldown
+      else
+        run_yarn_api_cooldown
+      end
+    end
+
+    # Native path: yarn resolves under its own age gate, so nothing can land
+    # inside the cooldown window and there is nothing to roll back.
+    #
+    # The gate is always passed in minutes. Yarn 4.15+ also accepts duration
+    # strings ("7d"), but 4.10-4.14 parse those with Number() — "7d" becomes 7,
+    # i.e. a seven *minute* gate that silently allows everything through.
+    def run_yarn_native_cooldown
+      ok = system(
+        { "YARN_NPM_MINIMAL_AGE_GATE" => (COOLDOWN_DAYS * 1440).to_s },
+        "yarn up '*'",
+        out: File::NULL, err: File::NULL
+      )
+      # Without this, a failed resolution is indistinguishable from "nothing to
+      # update" in the summary.
+      warn yellow("  ⚠ `yarn up` failed — rerun it directly to see why") unless ok
+
+      record_summary("yarn", yarn_lock_changed_count, {})
+    end
+
+    def run_yarn_api_cooldown
+      locked_before   = locked_yarn_versions
       outdated_before = yarn_outdated_packages
       system("yarn upgrade --latest --silent", out: File::NULL, err: File::NULL)
-      updated_count = `git diff --unified=0 yarn.lock 2>/dev/null | grep -c '^+  version'`.strip.to_i
 
       on_cooldown = cooldown_ages(outdated_before.transform_values { |i| i[:latest] }) { |name, ver| npm_age_days(name, ver) }
-      record_summary("yarn", updated_count, on_cooldown)
 
-      return if on_cooldown.empty?
-
-      on_cooldown.each do |name, info|
-        best     = npm_best_allowed_version(name)
-        prev     = outdated_before[name][:current]
-        use_best = best && Gem::Version.new(best) > Gem::Version.new(prev)
-        target   = use_best ? best : prev
-        info[:best] = best if use_best
-        set_package_json_version(name, target)
+      if on_cooldown.any?
+        on_cooldown.each do |name, info|
+          best     = npm_best_allowed_version(name)
+          prev     = outdated_before[name][:current]
+          use_best = best && Gem::Version.new(best) > Gem::Version.new(prev)
+          target   = use_best ? best : prev
+          info[:best] = best if use_best
+          set_package_json_version(name, target)
+        end
+        system("yarn install --silent", out: File::NULL, err: File::NULL)
       end
-      system("yarn install --silent", out: File::NULL, err: File::NULL)
+
+      on_cooldown.merge!(hold_back_young_lock_entries(locked_before)) { |_, direct, _| direct }
+      record_summary("yarn", yarn_lock_changed_count, on_cooldown)
+    end
+
+    def locked_yarn_versions
+      YarnLockfile.read.entries.each_with_object(Hash.new { |h, k| h[k] = [] }) do |entry, versions|
+        versions[entry.name] << entry.version
+      end
+    end
+
+    def hold_back_young_lock_entries(locked_before)
+      held    = {}
+      checked = []
+
+      YARN_LOCKFILE_PASSES.times do
+        lockfile = YarnLockfile.read
+        young = lockfile.entries.filter_map do |entry|
+          next if locked_before[entry.name].include?(entry.version) || checked.include?([entry.name, entry.version])
+
+          checked << [entry.name, entry.version]
+          age = npm_age_days(entry.name, entry.version)
+          [entry, age] if age && age < COOLDOWN_DAYS
+        end
+        break if young.empty?
+
+        pinned = young.count do |entry, age|
+          info   = held[entry.name] = { version: entry.version, age: age.round(1) }
+          target = npm_registry_resolved?(entry) && npm_best_allowed_version_for(entry.name, entry.ranges)
+          info[:kept] = true unless target
+          next false unless target
+
+          entry.replace(**npm_lock_fields(entry, target))
+          info[:best] = target
+        end
+        break if pinned.zero?
+
+        lockfile.write
+        warn yellow("  ⚠ `yarn install` failed after holding back lockfile entries — rerun it directly to see why") unless
+          system("yarn install --silent", out: File::NULL, err: File::NULL)
+      end
+
+      held
+    end
+
+    def npm_registry_resolved?(entry)
+      entry.resolved.to_s.match?(%r{\Ahttps://registry\.(yarnpkg\.com|npmjs\.org)/})
+    end
+
+    def npm_best_allowed_version_for(package, ranges)
+      data = npm_package_data(package)
+      return nil unless data
+
+      cutoff = Time.now - (COOLDOWN_DAYS * 86400)
+      data["time"].filter_map do |version, time|
+        next unless data.dig("versions", version)
+        next unless (Time.parse(time) <= cutoff rescue false)
+        next unless ranges.all? { |range| NpmRange.satisfies?(version, range) }
+
+        parsed = NpmRange.parse_version(version)
+        [parsed, version] if parsed
+      end.max_by(&:first)&.last
+    end
+
+    def npm_lock_fields(entry, version)
+      manifest = npm_package_data(entry.name).dig("versions", version)
+      dist     = manifest["dist"]
+      optional = manifest["optionalDependencies"] || {}
+      registry = entry.resolved[%r{\Ahttps://[^/]+}]
+
+      {
+        version: version,
+        resolved: "#{registry}#{URI(dist["tarball"]).path}##{dist["shasum"]}",
+        integrity: dist["integrity"],
+        dependencies: (manifest["dependencies"] || {}).except(*optional.keys),
+        optional_dependencies: optional
+      }
     end
 
     def yarn_outdated_packages
@@ -249,6 +361,38 @@ module DependencyUpdate
       rescue JSON::ParserError
         nil
       end.flatten(1).to_h
+    end
+
+    # Both lockfile formats write one "  version" line per resolved package
+    # (classic: `version "1.2.3"`, berry: `version: 1.2.3`).
+    def yarn_lock_changed_count
+      `git diff --unified=0 yarn.lock 2>/dev/null | grep -c '^+  version'`.strip.to_i
+    end
+
+    # Version of yarn as the project resolves it — a `packageManager` pin in
+    # package.json makes corepack hand us the project's yarn, not the global one.
+    def yarn_version
+      return @yarn_version if defined?(@yarn_version)
+
+      match = `yarn --version 2>/dev/null`[/\d+\.\d+\.\d+/]
+      @yarn_version = match && Gem::Version.new(match)
+    rescue => e
+      warn "  Could not determine yarn version: #{e.message}"
+      @yarn_version = nil
+    end
+
+    def yarn_supports_cooldown?
+      version = yarn_version
+      !version.nil? && version >= YARN_COOLDOWN_VERSION
+    end
+
+    def print_yarn_cooldown_notice
+      if yarn_supports_cooldown?
+        puts dim("yarn #{yarn_version}: native cooldown active (npmMinimalAgeGate #{COOLDOWN_DAYS * 1440} minutes)")
+      else
+        current = yarn_version || "unknown"
+        puts yellow("⚠ yarn #{current} has no native age gate — upgrade to >= #{YARN_COOLDOWN_VERSION} (`yarn set version stable`) for built-in supply-chain protection. Using API-based fallback for now.")
+      end
     end
 
     def npm_package_data(package)
@@ -289,6 +433,8 @@ module DependencyUpdate
 
     # ── Importmap ─────────────────────────────────────────────────────────────
 
+    # importmap-rails has no native cooldown of any kind, so this ecosystem
+    # always goes through the registry.npmjs.org based logic.
     def run_importmap_updates_with_cooldown
       section("importmap update")
       before = parse_importmap_versions
@@ -365,7 +511,13 @@ module DependencyUpdate
           latest  = info[:version]
           age     = info[:age]
           best    = info[:best]
-          note    = best ? " → installed #{green(best)}" : ""
+          note    = if best
+                      " → installed #{green(best)}"
+                    elsif info[:kept]
+                      " → #{yellow("still installed, no older version fits the lockfile ranges")}"
+                    else
+                      ""
+                    end
           puts "    #{name} #{latest} #{dim("(#{age} days old)")}#{note}"
         end
       end
