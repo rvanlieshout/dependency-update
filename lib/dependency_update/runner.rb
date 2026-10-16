@@ -31,6 +31,7 @@ module DependencyUpdate
 
       @summary    = []
       @held_back  = []
+      @stale_resolutions = []
       @npm_cache  = {}
       @gem_cache  = {}
 
@@ -232,6 +233,40 @@ module DependencyUpdate
       else
         run_yarn_api_cooldown
       end
+
+      check_yarn_resolutions
+    end
+
+    def check_yarn_resolutions
+      dependents = yarn_supports_cooldown? ? nil : yarn_lock_dependency_names
+
+      package_json_resolutions.each do |selector, pinned|
+        name = selector[%r{(@[^/]+/[^/]+|[^/@][^/]*)\z}]
+        next unless name
+
+        reasons = []
+        reasons << "no package in yarn.lock depends on it" if dependents && !dependents.include?(name)
+
+        best = NpmRange.parse_version(pinned) && npm_best_allowed_version_for(name, ["*"])
+        if best && NpmRange.parse_version(best) > NpmRange.parse_version(pinned)
+          reasons << "#{best} is available and older than #{COOLDOWN_DAYS} days"
+        end
+
+        @stale_resolutions << [selector, pinned, reasons] if reasons.any?
+      end
+    end
+
+    def package_json_resolutions
+      return {} unless File.exist?("package.json")
+
+      JSON.parse(File.read("package.json")).fetch("resolutions", {}).select { |_, pinned| pinned.is_a?(String) }
+    rescue JSON::ParserError => e
+      warn "  Could not read resolutions from package.json: #{e.message}"
+      {}
+    end
+
+    def yarn_lock_dependency_names
+      YarnLockfile.read.entries.flat_map(&:dependency_names).uniq
     end
 
     # Native path: yarn resolves under its own age gate, so nothing can land
@@ -519,6 +554,14 @@ module DependencyUpdate
                       ""
                     end
           puts "    #{name} #{latest} #{dim("(#{age} days old)")}#{note}"
+        end
+      end
+
+      if @stale_resolutions.any?
+        puts
+        puts "  #{yellow("stale resolutions")} in package.json — not changed, review by hand:"
+        @stale_resolutions.each do |selector, pinned, reasons|
+          puts "    #{selector} #{pinned} #{dim("(#{reasons.join("; ")})")}"
         end
       end
       puts dim("─" * 42)

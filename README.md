@@ -64,6 +64,11 @@ satisfies every range of that lockfile entry, followed by `yarn install`. This
 repeats for dependencies the replacement pulls in. When no older version fits
 the ranges, the young version stays and the summary says so.
 
+`resolutions` in `package.json` are deliberate overrides, so they are never
+changed. The summary lists a resolution as stale when a newer version older than
+the cooldown exists, or, with yarn classic, when no package in `yarn.lock`
+depends on it anymore and the override has no effect.
+
 Note that yarn 4.15+ applies a one day gate by default, so a yarn project has
 some protection even without this tool.
 

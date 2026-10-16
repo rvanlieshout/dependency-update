@@ -24,6 +24,13 @@ module DependencyUpdate
 
       def resolved = field("resolved")
 
+      def dependency_names
+        lines.filter_map do |line|
+          match = line.match(/\A {4}("(?:[^"\\]|\\.)*"|\S+) /)
+          match && unwrap(match[1])
+        end
+      end
+
       def field(key)
         line = lines.find { |candidate| candidate.start_with?("  #{key} ") }
         line && unwrap(line.delete_prefix("  #{key} "))

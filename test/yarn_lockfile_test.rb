@@ -41,6 +41,23 @@ class YarnLockfileTest < Minitest::Test
     assert_equal "https://registry.yarnpkg.com/modern-tar/-/modern-tar-0.8.6.tgz#123", entries[2].resolved
   end
 
+  def test_dependency_names
+    entries = DependencyUpdate::YarnLockfile.new(LOCKFILE).entries
+
+    assert_equal ["modern-tar", "semver"], entries[0].dependency_names
+    assert_empty entries[1].dependency_names
+  end
+
+  def test_dependency_names_unwraps_scoped_packages
+    lockfile = DependencyUpdate::YarnLockfile.new(LOCKFILE)
+    lockfile.entries.last.replace(
+      version: "0.8.5", resolved: "https://registry.yarnpkg.com/x.tgz#1", integrity: nil,
+      dependencies: { "@scope/pkg" => "^1.0.0" }, optional_dependencies: { "fsevents" => "~2.3.2" }
+    )
+
+    assert_equal ["@scope/pkg", "fsevents"], lockfile.entries.last.dependency_names
+  end
+
   def test_replace_rewrites_only_that_entry
     lockfile = DependencyUpdate::YarnLockfile.new(LOCKFILE)
     lockfile.entries.last.replace(
