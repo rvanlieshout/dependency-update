@@ -324,9 +324,9 @@ module DependencyUpdate
       YARN_LOCKFILE_PASSES.times do
         lockfile = YarnLockfile.read
         young = lockfile.entries.filter_map do |entry|
-          next if locked_before[entry.name].include?(entry.version) || checked.include?([entry.name, entry.version])
+          next if locked_before[entry.name].include?(entry.version) || checked.include?([entry.name, entry.version, entry.ranges])
 
-          checked << [entry.name, entry.version]
+          checked << [entry.name, entry.version, entry.ranges]
           age = npm_age_days(entry.name, entry.version)
           [entry, age] if age && age < COOLDOWN_DAYS
         end
